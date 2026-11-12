@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*~
+.venv/
+venv/
+*.npy

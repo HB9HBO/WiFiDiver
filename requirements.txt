@@ -1,0 +1,4 @@
+PyQt6
+pyqtgraph>=0.13
+numpy
+# optional: uhd (python3-uhd aus den Distributionspaketen), hackrf-Tools (hackrf_sweep)
