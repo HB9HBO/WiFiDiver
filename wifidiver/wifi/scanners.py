@@ -11,6 +11,7 @@ import time
 
 from . import oui
 from .channels import channel_to_freq
+from .connection import LinkInfo, query_iw
 from .iw_parser import parse_scan_dump
 from .model import AccessPoint
 
@@ -59,6 +60,17 @@ class Scanner:
 
     def scan(self) -> list[AccessPoint]:
         raise NotImplementedError
+
+    def connection(self) -> LinkInfo | None:
+        """Aktuelle Verbindung (unabhängig vom Scan-Interface: erstes verbundenes WLAN-Interface)."""
+        iw = _iw_bin()
+        ifaces = wireless_interfaces()
+        if not iw or not ifaces:
+            return None
+        if self.iface in ifaces:
+            ifaces.remove(self.iface)
+            ifaces.insert(0, self.iface)
+        return query_iw(iw, ifaces)
 
 
 class IwScanner(Scanner):
@@ -204,7 +216,42 @@ class DemoScanner(Scanner):
                              connected=bssid.endswith("22:02"))
             ap.vendor = oui.lookup(bssid)
             aps.append(ap.finalize())
+        self._last = aps
         return aps
+
+    def connection(self) -> LinkInfo | None:
+        """Simulierte Verbindung zum Demo-AP 'Heimnetz' (5 GHz)."""
+        ap = next((a for a in getattr(self, "_last", []) if a.connected), None)
+        if ap is None:
+            return LinkInfo("demo0")
+        c = self._ctr = getattr(self, "_ctr", {"t": time.time(), "rx": 5e8, "tx": 8e7, "rp": 4e5,
+                                               "tp": 2e5, "re": 9000, "busy": 0, "act": 0})
+        dt = time.time() - c["t"]
+        c["t"] = time.time()
+        c["rx"] += dt * random.uniform(0.2e6, 4e6)
+        c["tx"] += dt * random.uniform(0.05e6, 0.6e6)
+        c["rp"] += int(dt * 400)
+        c["tp"] += int(dt * 250)
+        c["re"] += int(dt * 250 * random.uniform(0.02, 0.08))
+        c["act"] += int(dt * 1000)
+        c["busy"] += int(dt * 1000 * random.uniform(0.15, 0.35))
+        sig = ap.signal
+        return LinkInfo(
+            "demo0", True, ap.bssid, ap.ssid, ap.freq,
+            link={"ssid": ap.ssid, "freq": f"{ap.freq:.1f}", "signal": f"{sig:.0f} dBm",
+                  "dtim period": "1", "beacon int": "100"},
+            station={"rx bytes": str(int(c["rx"])), "tx bytes": str(int(c["tx"])),
+                     "rx packets": str(int(c["rp"])), "tx packets": str(int(c["tp"])),
+                     "tx retries": str(int(c["re"])), "tx failed": "12", "rx drop misc": "41",
+                     "signal": f"{sig:.0f} [{sig - 2:.0f}, {sig - 4:.0f}] dBm",
+                     "signal avg": f"{sig + 1:.0f} [{sig - 1:.0f}, {sig - 3:.0f}] dBm",
+                     "tx bitrate": "720.6 MBit/s 80MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0",
+                     "rx bitrate": "960.8 MBit/s 80MHz HE-MCS 9 HE-NSS 2 HE-GI 0 HE-DCM 0",
+                     "expected throughput": "512.45Mbps", "authorized": "yes",
+                     "inactive time": f"{random.randint(0, 80)} ms",
+                     "connected time": str(int(3723 + c["act"] / 1000))},
+            survey={"frequency": f"{ap.freq:.0f} MHz [in use]", "noise": "-92 dBm",
+                    "channel active time": f"{c['act']} ms", "channel busy time": f"{c['busy']} ms"})
 
 
 SCANNERS = {"iw": IwScanner, "nmcli": NmcliScanner, "demo": DemoScanner}

@@ -152,6 +152,7 @@ def parse_ap(bssid: str, lines: list[str], associated: bool = False) -> AccessPo
         return None
 
     ap = AccessPoint(bssid=bssid, freq=freq, connected=associated)
+    ap.extra["ies"] = lines          # Rohdaten für den Details-Tab
     ap.ssid = _unescape_ssid(fields.get("SSID", ""))
     sig = fields.get("signal", "")
     try:

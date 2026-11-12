@@ -6,23 +6,29 @@ import time
 
 from PyQt6.QtCore import QSettings, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDockWidget, QHBoxLayout,
-                             QHeaderView, QLabel, QLineEdit, QMainWindow, QScrollArea, QSpinBox,
-                             QSplitter, QTableView, QTabWidget, QVBoxLayout, QWidget)
+                             QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QPushButton,
+                             QScrollArea, QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout,
+                             QWidget)
 
 from ..sdr import BACKENDS
 from ..sdr.base import SdrBackend
 from ..sdr.demo import DemoBackend
 from ..wifi import overlays, scanners
+from ..wifi.connection import ConnectionView
+from ..wifi.details import ap_details, raw_text
 from ..wifi.model import AccessPoint
 from .ap_table import ApFilterProxy, ApTableModel
 from .band_panel import BandPanel
 from .history import HistoryWidget
+from .info_page import InfoPage
+from .ssid_list import MODES, SsidList, SsidListDialog
 from .sdr_panel import SdrPanel
 
 
 class ScanWorker(QThread):
     scanned = pyqtSignal(list)
     failed = pyqtSignal(str)
+    link = pyqtSignal(object)          # LinkInfo | None (aktuelle Verbindung)
 
     def __init__(self, scanner: scanners.Scanner, interval: float):
         super().__init__()
@@ -39,6 +45,10 @@ class ScanWorker(QThread):
                     self.scanned.emit(self.scanner.scan())
                 except Exception as exc:  # noqa: BLE001
                     self.failed.emit(f"{self.scanner.name}: {exc}")
+            try:
+                self.link.emit(self.scanner.connection())
+            except Exception:  # noqa: BLE001 - Verbindungsanzeige ist optional
+                self.link.emit(None)
             while not self._quit and time.time() - t0 < self.interval:
                 self.msleep(100)
 
@@ -82,6 +92,9 @@ class MainWindow(QMainWindow):
         self.sdr_band: str = band or str(self.settings.value("band", "2.4"))
         self._sweep_times: list[float] = []
         self._last_sweep = None
+        self.ssid_list = SsidList(self.settings)
+        self.conn_view = ConnectionView()
+        self._link = None
 
         self._build_toolbar(source, iface)
         self._build_central()
@@ -91,6 +104,7 @@ class MainWindow(QMainWindow):
         self.worker = ScanWorker(self._make_scanner(), float(self.interval.value()))
         self.worker.scanned.connect(self._on_scan)
         self.worker.failed.connect(self._on_scan_failed)
+        self.worker.link.connect(self._on_link)
         self.worker.start()
 
         # GUI-Timer für SDR-Daten
@@ -171,9 +185,22 @@ class MainWindow(QMainWindow):
         fl.addWidget(self.filter, 1)
         self.only_band = QCheckBox("nur aktuelles Band")
         fl.addWidget(self.only_band)
+        fl.addWidget(QLabel("  SSIDs:"))
+        self.ssid_mode = QComboBox()
+        for key, text in MODES:
+            self.ssid_mode.addItem(text, key)
+        self.ssid_mode.setToolTip("Filter über die eigene SSID-Liste (★): nur diese Netze anzeigen oder "
+                                  "sie ausblenden – gilt für Tabelle, Kanalgraph und Signalverlauf")
+        i = self.ssid_mode.findData(str(self.settings.value("ssid_list/mode", "all")))
+        self.ssid_mode.setCurrentIndex(max(i, 0))
+        fl.addWidget(self.ssid_mode)
+        self.ssid_btn = QPushButton("Liste …")
+        self.ssid_btn.setToolTip("SSID-Liste bearbeiten (Rechtsklick in der Tabelle: SSID hinzufügen/entfernen)")
+        fl.addWidget(self.ssid_btn)
         tl.addLayout(fl)
 
         self.model = ApTableModel(self)
+        self.model.marked = self.ssid_list.matches
         self.proxy = ApFilterProxy(self)
         self.proxy.setSourceModel(self.model)
         self.table = QTableView()
@@ -190,6 +217,8 @@ class MainWindow(QMainWindow):
         hh.setStretchLastSection(True)
         for col, w in enumerate([24, 170, 130, 170, 60, 70, 70, 85, 90, 190, 80, 80, 60, 70]):
             self.table.setColumnWidth(col, w)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
         tl.addWidget(self.table)
         split.addWidget(top)
 
@@ -202,11 +231,19 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(p, p.band.name)
         self.history = HistoryWidget()
         self.tabs.addTab(self.history, "Signalverlauf")
+        self.details = InfoPage("AP in der Tabelle oder im Kanalgraph auswählen, um Details zu sehen.",
+                                raw=True)
+        self.tabs.addTab(self.details, "Details")
+        self.conn_page = InfoPage("Verbindung wird abgefragt …")
+        self.tabs.addTab(self.conn_page, "Verbindung")
         split.addWidget(self.tabs)
         split.setSizes([300, 650])
         self.setCentralWidget(split)
 
         self.filter.textChanged.connect(self.proxy.set_text)
+        self.ssid_mode.currentIndexChanged.connect(lambda _: self._apply_ssid_filter())
+        self.ssid_btn.clicked.connect(self._edit_ssid_list)
+        self._apply_ssid_filter(refresh=False)
         self.only_band.toggled.connect(lambda _: self._update_band_filter())
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.table.selectionModel().selectionChanged.connect(self._on_table_selection)
@@ -292,10 +329,12 @@ class MainWindow(QMainWindow):
     def _on_scan(self, aps: list) -> None:
         self.aps = aps
         self.model.set_aps(aps)
-        for p in self.panels.values():
-            p.set_aps(aps)
+        self._push_aps()
         self.history.add_scan(aps)
         self._reselect()
+        self._update_details()
+        if self._link is not None:
+            self._show_link()
         counts = {k: sum(1 for a in aps if a.band == k) for k in self.BAND_KEYS}
         self.status_aps.setText(
             f"{len(aps)} APs  (2.4 GHz: {counts['2.4']}, 5 GHz: {counts['5']}, 6 GHz: {counts['6']})"
@@ -304,6 +343,74 @@ class MainWindow(QMainWindow):
 
     def _on_scan_failed(self, msg: str) -> None:
         self.scan_info.setText(msg)
+
+    # ------------------------------------------------------------------ SSID-Liste
+    def _ssid_ok(self, ssid: str) -> bool:
+        return self.ssid_list.accepts(ssid, self.ssid_mode.currentData())
+
+    def _push_aps(self) -> None:
+        """Gefilterte APs an die Kanalgraphen (Signalerkennung bekommt immer alle)."""
+        visible = [a for a in self.aps if self._ssid_ok(a.ssid)]
+        for p in self.panels.values():
+            p.set_aps(visible, self.aps)
+
+    def _apply_ssid_filter(self, refresh: bool = True) -> None:
+        self.settings.setValue("ssid_list/mode", self.ssid_mode.currentData())
+        self.proxy.set_ssid_filter(self._ssid_ok)
+        self.history.accept_ssid = self._ssid_ok
+        if refresh:
+            self._push_aps()
+            self.history.redraw()
+            self.model.layoutChanged.emit()
+
+    def _edit_ssid_list(self) -> None:
+        dlg = SsidListDialog(self.ssid_list.entries, [a.ssid for a in self.aps], self)
+        if dlg.exec():
+            self.ssid_list.set_entries(dlg.entries())
+            self._apply_ssid_filter()
+
+    def _table_menu(self, pos) -> None:
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
+            return
+        ap = self.model.aps[self.proxy.mapToSource(idx).row()]
+        menu = QMenu(self)
+        if ap.ssid:
+            if ap.ssid in self.ssid_list.entries:
+                act = menu.addAction(f"„{ap.ssid}“ aus der SSID-Liste entfernen")
+                act.triggered.connect(lambda: (self.ssid_list.remove(ap.ssid), self._apply_ssid_filter()))
+            elif self.ssid_list.matches(ap.ssid):
+                menu.addAction(f"„{ap.ssid}“ passt auf ein Muster der Liste").setEnabled(False)
+            else:
+                act = menu.addAction(f"„{ap.ssid}“ zur SSID-Liste hinzufügen")
+                act.triggered.connect(lambda: (self.ssid_list.add(ap.ssid), self._apply_ssid_filter()))
+        else:
+            menu.addAction("Verstecktes Netz (keine SSID)").setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("SSID-Liste bearbeiten …").triggered.connect(self._edit_ssid_list)
+        menu.addAction("Details anzeigen").triggered.connect(
+            lambda: (self._select_bssid(ap.bssid), self.tabs.setCurrentWidget(self.details)))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------ Details / Verbindung
+    def _update_details(self) -> None:
+        ap = next((a for a in self.aps if a.bssid == self.selected), None)
+        if ap is None:
+            if self.selected is None:
+                self.details.set_content("AP in der Tabelle oder im Kanalgraph auswählen, "
+                                         "um Details zu sehen.", [])
+            else:
+                self.details.set_content(f"{self.selected}: nicht mehr im Scan", [])
+            return
+        self.details.set_content(f"{ap.display_ssid}   ({ap.bssid})", ap_details(ap), raw_text(ap))
+
+    def _on_link(self, info) -> None:
+        self._link = info
+        self._show_link()
+
+    def _show_link(self) -> None:
+        title, sections = self.conn_view.sections(self._link, self.aps)
+        self.conn_page.set_content(title, sections)
 
     # ------------------------------------------------------------------ Auswahl
     def _on_table_selection(self, *_):
@@ -319,6 +426,7 @@ class MainWindow(QMainWindow):
         for p in self.panels.values():
             p.set_selected(bssid)
         self.history.set_selected(bssid)
+        self._update_details()
 
     def _select_bssid(self, bssid: str) -> None:
         for r, ap in enumerate(self.model.aps):

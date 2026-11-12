@@ -337,9 +337,10 @@ class BandPanel(QWidget):
                 it.setVisible(vis)
 
     # ------------------------------------------------------------------ APs
-    def set_aps(self, aps: list[AccessPoint]) -> None:
+    def set_aps(self, aps: list[AccessPoint], all_aps: list[AccessPoint] | None = None) -> None:
+        """aps: angezeigte APs; all_aps: alle (für die Signalerkennung, unabhängig vom Filter)."""
         self.aps = [ap for ap in aps if ap.band == self.band.key]
-        self.clf.set_aps(self.aps)
+        self.clf.set_aps([ap for ap in (aps if all_aps is None else all_aps) if ap.band == self.band.key])
         seen = set()
         for ap in self.aps:
             seen.add(ap.bssid)

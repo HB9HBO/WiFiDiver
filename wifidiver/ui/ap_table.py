@@ -48,6 +48,7 @@ class ApTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.aps: list[AccessPoint] = []
+        self.marked = lambda ssid: False      # SSID in der eigenen Liste?
         self._bold = QFont()
         self._bold.setBold(True)
 
@@ -104,6 +105,8 @@ class ApTableModel(QAbstractTableModel):
         col = index.column()
         attr = COLUMNS[col][1]
         if role == Qt.ItemDataRole.DisplayRole and attr:
+            if attr == "display_ssid" and self.marked(ap.ssid):
+                return "★ " + ap.display_ssid
             return self._display(ap, attr)
         if role == Qt.ItemDataRole.UserRole:  # Sortierschlüssel
             if attr is None:
@@ -116,8 +119,10 @@ class ApTableModel(QAbstractTableModel):
             return QBrush(signal_color(ap.signal))
         if role == Qt.ItemDataRole.FontRole and ap.connected:
             return self._bold
-        if role == Qt.ItemDataRole.ToolTipRole and ap.connected:
-            return "verbunden"
+        if role == Qt.ItemDataRole.ToolTipRole:
+            tips = (["verbunden"] if ap.connected else []) + (
+                ["in der SSID-Liste"] if self.marked(ap.ssid) else [])
+            return ", ".join(tips) or None
         if role == Qt.ItemDataRole.TextAlignmentRole and attr in (
                 "channel", "width", "center_freq", "signal", "utilization", "stations", "last_seen_ms"):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -129,6 +134,7 @@ class ApFilterProxy(QSortFilterProxyModel):
         super().__init__(parent)
         self.text = ""
         self.band = None
+        self.accept_ssid = lambda ssid: True
         self.setSortRole(Qt.ItemDataRole.UserRole)
 
     def set_text(self, text: str) -> None:
@@ -139,9 +145,15 @@ class ApFilterProxy(QSortFilterProxyModel):
         self.band = band
         self.invalidateFilter()
 
+    def set_ssid_filter(self, accept) -> None:
+        self.accept_ssid = accept
+        self.invalidateFilter()
+
     def filterAcceptsRow(self, row, parent):
         ap = self.sourceModel().aps[row]
         if self.band and ap.band != self.band:
+            return False
+        if not self.accept_ssid(ap.ssid):
             return False
         if not self.text:
             return True

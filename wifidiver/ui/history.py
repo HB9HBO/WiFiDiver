@@ -22,6 +22,8 @@ class HistoryWidget(pg.PlotWidget):
         self.selected: str | None = None
         self.band_filter: str | None = None
         self.bands: dict[str, str | None] = {}
+        self.ssids: dict[str, str] = {}
+        self.accept_ssid = lambda ssid: True
         self.setLabel("left", "Signal", units="dBm")
         self.setLabel("bottom", "Zeit (s, relativ zu jetzt)")
         self.showGrid(x=True, y=True, alpha=0.2)
@@ -36,6 +38,7 @@ class HistoryWidget(pg.PlotWidget):
             dq.append((now, ap.signal))
             self.names[ap.bssid] = ap.display_ssid
             self.bands[ap.bssid] = ap.band
+            self.ssids[ap.bssid] = ap.ssid
         for bssid, dq in list(self.data.items()):
             while dq and dq[0][0] < now - self.window_s:
                 dq.popleft()
@@ -49,7 +52,9 @@ class HistoryWidget(pg.PlotWidget):
 
     def redraw(self) -> None:
         now = time.time()
-        wanted = {b for b in self.data if self.band_filter is None or self.bands.get(b) == self.band_filter}
+        wanted = {b for b in self.data
+                  if (self.band_filter is None or self.bands.get(b) == self.band_filter)
+                  and self.accept_ssid(self.ssids.get(b, ""))}
         for bssid in list(self.curves):
             if bssid not in wanted:
                 self.removeItem(self.curves.pop(bssid))

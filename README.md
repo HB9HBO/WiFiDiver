@@ -24,6 +24,17 @@ Zusätzlich zeigt der Kanalgraph das echte HF-Spektrum und einen **Wasserfall ei
   Dauerträger/Störlinien. Ergebnisliste der letzten 5 s, farbige Markierungen im Wasserfall (Mauszeiger
   darauf zeigt Frequenz, Breite, Dauer, Pegel). Keine Dekodierung, nur Frequenzraster, Breite, Dauer und
   Wiederholung.
+- **Details-Tab** zum ausgewählten AP: aufbereitete Informationselemente der Beacons – Standard, räumliche
+  Ströme, geschätzte max. PHY-Rate, Basisraten, PHY-Merkmale (Beamforming, MU-MIMO, TWT, 1024-QAM),
+  BSS-Color, Sendeleistung (TPC, 802.11d-Grenzwerte), Sicherheit (Cipher, AKM, PMF/802.11w, WPS),
+  Roaming (802.11k/v/r), BSS Load und Hersteller-IEs; dazu die Rohdaten von `iw`.
+- **Verbindung-Tab**: aktuelle WLAN-Verbindung (erstes verbundene Interface) mit Signal pro Antenne, Rauschen,
+  SNR, Kanalbelegung, RX/TX-Rate (MCS, Ströme, Breite, GI), erwartetem Durchsatz, aktuellem Verkehr,
+  TX-Wiederholungen/Fehlern und Roaming-Kandidaten (gleiche SSID). Quelle: `iw link`, `station dump`,
+  `survey dump` (ohne root).
+- **SSID-Liste**: eigene/bekannte Netze markieren (★, Rechtsklick in der Tabelle oder *Liste …*, Muster mit
+  `*` und `?`), Filter *Nur Liste* bzw. *Liste ausblenden* für Tabelle, Kanalgraph und Signalverlauf.
+  Die Signalerkennung berücksichtigt weiterhin alle APs.
 - Signalverlauf (2 Minuten) pro BSSID.
 - Demo-Modus für WLAN und SDR (zum Testen ohne Hardware).
 
@@ -146,10 +157,12 @@ Grenzen, die man kennen sollte:
 ```
 wifidiver/
   wifi/   channels.py (Kanal/Frequenz-Mathematik), iw_parser.py, scanners.py (iw/nmcli/Demo), oui.py,
-          overlays.py (Kanalraster anderer Funkdienste)
+          overlays.py (Kanalraster anderer Funkdienste), details.py (Details-Tab),
+          connection.py (Verbindung-Tab)
   sdr/    base.py (Thread, PSD, Raster-Resampling), hackrf.py, uhd_sdr.py, demo.py,
           classify.py (Signalerkennung)
-  ui/     main_window.py, band_panel.py (Kanalgraph+Wasserfall), ap_table.py, history.py, sdr_panel.py
+  ui/     main_window.py, band_panel.py (Kanalgraph+Wasserfall), ap_table.py, history.py, sdr_panel.py,
+          info_page.py (Details/Verbindung), ssid_list.py
 ```
 
 Neue SDRs: Klasse von `SdrBackend` ableiten, `params` und `run()` implementieren
