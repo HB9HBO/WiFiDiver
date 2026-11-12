@@ -85,6 +85,7 @@ class InfoPage(QScrollArea):
             b.deleteLater()
         self._boxes, self._values = [], []
         heights = [0, 0]
+        names: list[QLabel] = []
         bold = QFont(self.font())
         bold.setBold(True)
         normal = QFont(self.font())
@@ -100,6 +101,7 @@ class InfoPage(QScrollArea):
             for label, value in rows:
                 name = QLabel(label)
                 name.setFont(bold)
+                names.append(name)
                 val = QLabel(value)
                 val.setFont(normal)
                 val.setWordWrap(True)
@@ -111,3 +113,7 @@ class InfoPage(QScrollArea):
             v = self.col_lay[col]
             v.insertWidget(v.count() - 1, box)
             self._boxes.append(box)
+        # einheitliche Breite der Beschriftungsspalte in allen Karten -> Werte stehen bündig
+        width = max((n.sizeHint().width() for n in names), default=0)
+        for n in names:
+            n.setFixedWidth(width)

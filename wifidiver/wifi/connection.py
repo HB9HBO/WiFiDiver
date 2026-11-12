@@ -251,8 +251,9 @@ class ConnectionView:
         if exp is not None:
             rates.append(("Erwarteter Durchsatz", f"{exp:g} Mbit/s"))
         rxb, txb = delta("rx bytes"), delta("tx bytes")
-        if rxb is not None and txb is not None:
-            rates.append(("Aktueller Verkehr", f"↓ {rxb * 8 / dt / 1e6:.2f}  ↑ {txb * 8 / dt / 1e6:.2f} Mbit/s"))
+        rates.append(("Aktueller Verkehr",
+                      f"↓ {rxb * 8 / dt / 1e6:.2f}  ↑ {txb * 8 / dt / 1e6:.2f} Mbit/s"
+                      if rxb is not None and txb is not None else "– (wird gemessen)"))
 
         stats: list[Row] = [
             ("Empfangen", f"{_bytes(_num(st.get('rx bytes')))}  ({st.get('rx packets', '–')} Pakete)"),
@@ -262,9 +263,15 @@ class ConnectionView:
         if retr is not None:
             pct = f"  ({100 * retr / txp:.1f} %)" if txp else ""
             stats.append(("TX-Wiederholungen", f"{retr:.0f}{pct}"))
+            # immer anzeigen (sonst springt die Anzeige, wenn im Intervall nichts gesendet wurde)
             dr, dp = delta("tx retries"), delta("tx packets")
-            if dr is not None and dp:
-                stats.append(("TX-Wiederholungen aktuell", f"{100 * dr / dp:.1f} %"))
+            if dr is None or dp is None:
+                cur = "– (wird gemessen)"
+            elif dp == 0:
+                cur = "– (keine Pakete gesendet)"
+            else:
+                cur = f"{100 * dr / dp:.1f} %"
+            stats.append(("TX-Wiederholungen aktuell", cur))
         if fail is not None:
             pct = f"  ({100 * fail / txp:.2f} %)" if txp else ""
             stats.append(("TX fehlgeschlagen", f"{fail:.0f}{pct}"))

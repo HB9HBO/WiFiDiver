@@ -195,6 +195,14 @@ class ConnectionTest(unittest.TestCase):
         title2, sec2 = view.sections(view.last, aps)
         self.assertEqual(rows(sec2)["Kanal belegt"], "50 %  (eigene Messung)")
 
+    def test_rows_stable_without_traffic(self):
+        view = ConnectionView()
+        _, first = view.sections(self.info(1.0, 1000, 100, 10, 1000, 300), [])
+        _, idle = view.sections(self.info(3.0, 1000, 100, 10, 2000, 400), [])   # nichts gesendet
+        self.assertEqual([l for _, r in first for l, _ in r], [l for _, r in idle for l, _ in r])
+        self.assertEqual(rows(idle)["TX-Wiederholungen aktuell"], "– (keine Pakete gesendet)")
+        self.assertEqual(rows(first)["TX-Wiederholungen aktuell"], "– (wird gemessen)")
+
     def test_not_connected(self):
         title, sec = ConnectionView().sections(LinkInfo("wlan0"), [])
         self.assertIn("Nicht verbunden", title)
