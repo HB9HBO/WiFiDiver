@@ -46,6 +46,17 @@ class HistoryWidget(pg.PlotWidget):
                 del self.data[bssid]
         self.redraw()
 
+    def add_samples(self, samples: list) -> None:
+        """Zusätzliche Pegelwerte (Wanduhr, BSSID, dBm), z.B. aus den Beacons im Monitormodus."""
+        added = False
+        for t, bssid, sig in samples:
+            dq = self.data.get(bssid)
+            if dq is not None:
+                dq.append((t, sig))
+                added = True
+        if added:
+            self.redraw()
+
     def set_selected(self, bssid: str | None) -> None:
         self.selected = bssid
         self.redraw()
@@ -61,6 +72,7 @@ class HistoryWidget(pg.PlotWidget):
                 self.legend.removeItem(f"{self.names.get(bssid, '')} [{bssid[-5:]}]")
         for bssid in wanted:
             arr = np.array(self.data[bssid])
+            arr = arr[np.argsort(arr[:, 0], kind="stable")]
             col = ap_color(bssid)
             sel = bssid == self.selected
             pen = pg.mkPen(col, width=3.5 if sel else 1.5)

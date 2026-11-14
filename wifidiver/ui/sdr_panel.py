@@ -6,22 +6,68 @@ import time
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
-from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout,
                              QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton,
-                             QSlider, QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                             QSlider, QSpinBox, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                             QWidget)
 
 from ..sdr import BACKENDS
 from ..sdr.base import Param
-from ..wifi.channels import freq_to_channel
+from .band_panel import CURVE_COLORS
+from ..wifi.channels import band_channels, band_of_freq, channel_to_freq, freq_to_channel
 from ..wifi.overlays import OVERLAYS
 
 MIN_SPAN_MHZ = 5
+CH_HALF_MHZ = 10      # halbe Breite eines 20-MHz-Kanals – Pfeile springen auf Kanalränder
 
 COLORMAPS = ["inferno", "viridis", "magma", "plasma", "turbo", "CET-L8", "CET-L16"]
 DEFAULT_OFFSET = {"HackRF": -30.0, "UHD": -20.0, "Demo": 0.0}
 
 
 FPS_CHOICES = (25, 15, 10, 5)
+
+
+class ColorButton(QToolButton):
+    """Farbfeld; Klick öffnet die Farbauswahl (mit Deckkraft)."""
+    colorChanged = pyqtSignal(QColor)
+
+    def __init__(self, color, title: str, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.setFixedSize(34, 20)
+        self.setToolTip(f"Farbe: {title}")
+        self.clicked.connect(self._pick)
+        self.set_color(QColor(*color) if isinstance(color, tuple) else QColor(color))
+
+    def set_color(self, c: QColor) -> None:
+        self._color = QColor(c)
+        r, g, b, a = c.getRgb()
+        # Schachbrett-freie Vorschau: Farbe über dunklem Grund, so sieht man die Deckkraft
+        self.setStyleSheet(f"QToolButton {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                           f"stop:0 rgb({r},{g},{b}), stop:1 rgba({r},{g},{b},{a})); "
+                           f"border: 1px solid #777; border-radius: 3px; }}")
+
+    def color(self) -> QColor:
+        return QColor(self._color)
+
+    def _pick(self) -> None:
+        c = QColorDialog.getColor(self._color, self, self.title,
+                                  QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if c.isValid() and c != self._color:
+            self.set_color(c)
+            self.colorChanged.emit(c)
+
+
+def _pct_slider(value: int, tip: str) -> tuple[QSlider, QLabel]:
+    sl = QSlider(Qt.Orientation.Horizontal)
+    sl.setRange(0, 100)
+    sl.setValue(value)
+    sl.setToolTip(tip)
+    lbl = QLabel(f"{value} %")
+    lbl.setMinimumWidth(40)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    sl.valueChanged.connect(lambda v: lbl.setText(f"{v} %"))
+    return sl, lbl
 
 class SdrPanel(QWidget):
     backendChanged = pyqtSignal(str)
@@ -82,6 +128,20 @@ class SdrPanel(QWidget):
             r.addWidget(sl, 1)
             lbl.setMinimumWidth(118)
             r.addWidget(lbl)
+            arrows = QVBoxLayout()
+            arrows.setSpacing(0)
+            for arrow, step, tip in ((Qt.ArrowType.UpArrow, 1, "nächster Kanal"),
+                                     (Qt.ArrowType.DownArrow, -1, "vorheriger Kanal")):
+                b = QToolButton()
+                b.setArrowType(arrow)
+                b.setFixedSize(20, 12)
+                b.setAutoRepeat(True)
+                b.setAutoRepeatDelay(400)
+                b.setAutoRepeatInterval(150)
+                b.setToolTip(f"{text}: {tip}")
+                b.clicked.connect(lambda _=False, which=text, d=step: self.step_channel(which, d))
+                arrows.addWidget(b)
+            r.addLayout(arrows)
             rl.addLayout(r)
             sl.setSingleStep(1)
             sl.setPageStep(20)
@@ -147,11 +207,55 @@ class SdrPanel(QWidget):
         self.cb_avg = QCheckBox("Mittelwert")
         self.cb_live.setChecked(True)
         self.cb_peak.setChecked(True)
-        for cb in (self.cb_live, self.cb_peak, self.cb_avg):
-            f.addRow("", cb)
+        self.col_btn: dict[str, ColorButton] = {}
+
+        def curve_row(key: str, cb: QCheckBox) -> None:
+            r = QHBoxLayout()
+            r.addWidget(cb, 1)
+            btn = ColorButton(CURVE_COLORS[key], cb.text())
+            btn.colorChanged.connect(lambda _c: self.displayChanged.emit())
+            self.col_btn[key] = btn
+            r.addWidget(btn)
+            f.addRow("", r)
             cb.toggled.connect(self.displayChanged)
+
+        def sub_row(lead: QWidget, slider: QSlider, lbl: QLabel) -> None:
+            r = QHBoxLayout()
+            r.addSpacing(22)                  # eingerückt: gehört zum Live-Spektrum
+            lead.setFixedWidth(84)
+            r.addWidget(lead)
+            r.addWidget(slider, 1)
+            r.addWidget(lbl)
+            f.addRow("", r)
+            slider.valueChanged.connect(lambda _v: self.displayChanged.emit())
+
+        curve_row("live", self.cb_live)
+        self.live_avg, avg_lbl = _pct_slider(0, "Glättet das Live-Spektrum über mehrere Sweeps "
+                                                "(0 % = aus, 100 % = Mittel über ca. 10 Sweeps)")
+        sub_row(QLabel("Mittelung"), self.live_avg, avg_lbl)
+        self.cb_fill = QCheckBox("Füllung")
+        self.cb_fill.setToolTip("Fläche unter dem Live-Spektrum füllen (Farbe des Live-Spektrums, "
+                                "Verlauf nach unten). Kostet etwas CPU.")
+        self.cb_fill.toggled.connect(self.displayChanged)
+        self.fill_alpha, fill_lbl = _pct_slider(50, "Deckkraft der Füllung")
+        sub_row(self.cb_fill, self.fill_alpha, fill_lbl)
+        curve_row("peak", self.cb_peak)
+        curve_row("avg", self.cb_avg)
+        r = QHBoxLayout()
+        reset = QPushButton("Standardfarben")
+        reset.setToolTip("Farben der Kurven zurücksetzen")
+        reset.clicked.connect(self.reset_colors)
+        r.addWidget(reset)
         self.peak_btn = QPushButton("Peak zurücksetzen")
-        f.addRow("", self.peak_btn)
+        r.addWidget(self.peak_btn)
+        f.addRow("", r)
+        r = QHBoxLayout()
+        self.ap_alpha, ap_lbl = _pct_slider(100, "Intensität der WLAN-Kanäle im Kanalgraphen: "
+                                                 "100 % = volle Stärke, 0 % = ausgeblendet")
+        self.ap_alpha.valueChanged.connect(lambda _v: self.displayChanged.emit())
+        r.addWidget(self.ap_alpha, 1)
+        r.addWidget(ap_lbl)
+        f.addRow("WLAN-Kanäle", r)
         lay.addWidget(disp)
 
         # Automatische Signalerkennung -----------------------------------------
@@ -329,6 +433,19 @@ class SdrPanel(QWidget):
         self.ovl_none.setText("" if n else "keine für dieses Band")
         self.ovl_none.setVisible(not n)
 
+    # -- Farben ----------------------------------------------------------
+    def curve_colors(self) -> dict[str, QColor]:
+        return {k: b.color() for k, b in self.col_btn.items()}
+
+    def set_curve_colors(self, colors: dict) -> None:
+        for k, c in colors.items():
+            if k in self.col_btn and QColor(c).isValid():
+                self.col_btn[k].set_color(QColor(c))
+        self.displayChanged.emit()
+
+    def reset_colors(self) -> None:
+        self.set_curve_colors({k: QColor(*v) for k, v in CURVE_COLORS.items()})
+
     # -- Sweep-Bereich ----------------------------------------------------
     def set_range_limits(self, f_min: float, f_max: float, lo: float, hi: float) -> None:
         """Slidergrenzen (Band) und aktuellen Bereich setzen, ohne Signal."""
@@ -343,6 +460,53 @@ class SdrPanel(QWidget):
 
     def range_values(self) -> tuple[float, float]:
         return float(self.sl_min.value()), float(self.sl_max.value())
+
+    def _channel_edges(self, which: str) -> list[int]:
+        """Kanalränder im aktuellen Band: untere Ränder für 'min', obere für 'max'."""
+        f_min, f_max = self.sl_min.minimum(), self.sl_min.maximum()
+        band = band_of_freq((f_min + f_max) / 2)
+        if band is None:
+            return []
+        off = -CH_HALF_MHZ if which == "min" else CH_HALF_MHZ
+        edges = (int(round(channel_to_freq(ch, band))) + off for ch in band_channels(band))
+        return sorted({e for e in edges if f_min <= e <= f_max})
+
+    def _edge_channel(self, which: str, f: int) -> int | None:
+        """Kanal, dessen unterer ('min') bzw. oberer ('max') Rand genau bei f liegt."""
+        f_min, f_max = self.sl_min.minimum(), self.sl_min.maximum()
+        band = band_of_freq((f_min + f_max) / 2)
+        if band is None:
+            return None
+        center = f + (CH_HALF_MHZ if which == "min" else -CH_HALF_MHZ)
+        for ch in band_channels(band):
+            if int(round(channel_to_freq(ch, band))) == center:
+                return ch
+        return None
+
+    def step_channel(self, which: str, direction: int) -> None:
+        """min/max um einen 20-MHz-Kanal verschieben (auf dessen unteren bzw. oberen Rand)."""
+        sl = self.sl_min if which == "min" else self.sl_max
+        cur = sl.value()
+        edges = self._channel_edges(which)
+        if direction > 0:
+            nxt = next((e for e in edges if e > cur), sl.maximum() if which == "max" else None)
+        else:
+            nxt = next((e for e in reversed(edges) if e < cur), sl.minimum() if which == "min" else None)
+        if nxt is None or nxt == cur:
+            return
+        # schiebt min über max (oder umgekehrt), den anderen auf denselben Kanal mitnehmen
+        lo, hi = self.sl_min.value(), self.sl_max.value()
+        if which == "min" and nxt > hi - MIN_SPAN_MHZ:
+            other, val = self.sl_max, min(nxt + 2 * CH_HALF_MHZ, sl.maximum())
+        elif which == "max" and nxt < lo + MIN_SPAN_MHZ:
+            other, val = self.sl_min, max(nxt - 2 * CH_HALF_MHZ, sl.minimum())
+        else:
+            other = None
+        if other is not None:
+            other.blockSignals(True)
+            other.setValue(val)
+            other.blockSignals(False)
+        sl.setValue(nxt)            # löst _slider_moved aus (Mindestbreite, Labels, Neustart)
 
     def _slider_moved(self, which: str) -> None:
         lo, hi = self.sl_min.value(), self.sl_max.value()
@@ -362,8 +526,11 @@ class SdrPanel(QWidget):
 
     def _update_range_labels(self) -> None:
         lo, hi = self.range_values()
-        self.lbl_min.setText(f"{lo:.0f} MHz (Kanal {freq_to_channel(lo)})")
-        self.lbl_max.setText(f"{hi:.0f} MHz (Kanal {freq_to_channel(hi)})")
+        for which, f, lbl in (("min", lo, self.lbl_min), ("max", hi, self.lbl_max)):
+            ch = self._edge_channel(which, int(f))
+            where = (f"ab Kanal {ch}" if which == "min" else f"bis Kanal {ch}") if ch is not None \
+                else f"Kanal {freq_to_channel(f)}"
+            lbl.setText(f"{f:.0f} MHz ({where})")
         full = (self.sl_min.value() == self.sl_min.minimum() and self.sl_max.value() == self.sl_max.maximum())
         self.lbl_span.setText(f"Breite {hi - lo:.0f} MHz" + ("  (ganzes Band)" if full else ""))
 

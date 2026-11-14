@@ -56,3 +56,122 @@ class WaterfallItemTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(QApplication is None, "PyQt6 fehlt")
+class RangeArrowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_step_channel_5ghz(self):
+        from wifidiver.ui.sdr_panel import SdrPanel
+        p = SdrPanel()
+        p.set_range_limits(5150, 5895, 5150, 5895)
+        p.step_channel("min", 1)
+        self.assertEqual(p.range_values(), (5170.0, 5895.0))        # Kanal 36 unterer Rand
+        self.assertIn("ab Kanal 36", p.lbl_min.text())
+        p.step_channel("max", -1)
+        self.assertEqual(p.range_values()[1], 5875.0)               # bis Kanal 173
+        for _ in range(8):
+            p.step_channel("min", 1)
+        self.assertEqual(p.range_values()[0], 5490.0)               # Lücke 64 -> 100 übersprungen
+        p.step_channel("min", -1)
+        self.assertEqual(p.range_values()[0], 5310.0)               # zurück auf Kanal 64
+        p.step_channel("max", -1)
+        p.set_range_limits(5150, 5895, 5170, 5190)
+        p.step_channel("min", 1)                                    # schiebt max mit
+        self.assertEqual(p.range_values(), (5190.0, 5210.0))
+
+    def test_step_channel_24ghz_clamps(self):
+        from wifidiver.ui.sdr_panel import SdrPanel
+        p = SdrPanel()
+        p.set_range_limits(2400, 2495, 2402, 2494)
+        p.step_channel("min", -1)
+        self.assertEqual(p.range_values()[0], 2400.0)               # bis an den Bandrand
+        p.step_channel("max", 1)
+        self.assertEqual(p.range_values()[1], 2495.0)
+        p.step_channel("max", -1)
+        self.assertIn("bis Kanal 14", p.lbl_max.text())
+
+
+@unittest.skipIf(QApplication is None, "PyQt6 fehlt")
+class LiveAveragingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_live_averaging(self):
+        from wifidiver.ui.band_panel import BandPanel
+        p = BandPanel("2.4")
+        p.detect_on = False
+        f = np.linspace(2400, 2495, 3000)
+        p.push_sweep(f, np.full(f.size, -90.0), 0.0)
+        p.push_sweep(f, np.full(f.size, -50.0), 0.04)
+        self.assertAlmostEqual(float(np.nanmean(p.live)), -50.0, places=3)   # 0 % = ungeglättet
+        p.set_live_averaging(100)
+        p.push_sweep(f, np.full(f.size, -90.0), 0.08)
+        m = float(np.nanmean(p.live))
+        self.assertTrue(-55.0 < m < -52.0, m)                                # nur langsam nachgeführt
+        for i in range(200):
+            p.push_sweep(f, np.full(f.size, -90.0), 0.12 + i * 0.04)
+        self.assertAlmostEqual(float(np.nanmean(p.live)), -90.0, places=1)
+
+
+@unittest.skipIf(QApplication is None, "PyQt6 fehlt")
+class MonitorPageTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_nets_and_events_tables(self):
+        import tempfile
+        from PyQt6.QtCore import QSettings
+        from tests.test_monitor import AP, BCAST, R_CHANNEL, R_FRAME, R_READY, beacon, deauth, radiotap, rec
+        from wifidiver.ui.monitor_page import MonitorPage
+        from wifidiver.wifi.monitor import MonitorStats
+        st = MonitorStats()
+        st.feed(rec(R_READY, b"wdmon0", origlen=1) + rec(R_CHANNEL, aux=250))
+        for i in range(10):
+            st.feed(rec(R_FRAME, radiotap(-30) + beacon(seq=100 + i), ts=i * 100_000_000))
+        for i in range(15):
+            st.feed(rec(R_FRAME, radiotap(-75) + deauth(dst=BCAST, seq=7), ts=(1000 + i * 20) * 1_000_000))
+        snap = st.snapshot()
+        with tempfile.TemporaryDirectory() as d:
+            page = MonitorPage(QSettings(os.path.join(d, "t.conf"), QSettings.Format.IniFormat))
+            alerts = []
+            page.alert.connect(alerts.append)
+            page.backend.snapshot = snap
+            page.backend.poll = lambda: True
+            page._poll()
+            self.assertEqual(alerts, [1])
+            self.assertIn("1 auffällig", page.sub.tabText(2))
+            page.sub.setCurrentIndex(1)
+            page._show()
+            self.assertEqual(page.net_table.rowCount(), 1)
+            col = MonitorPage.NET_COLS.index("Deauth/Disassoc")
+            self.assertEqual(page.net_table.item(0, col).text(), "15")
+            page.sub.setCurrentIndex(2)
+            page._show()
+            self.assertEqual(page.ev_table.rowCount(), 1)
+            self.assertIn("Angriff", page.ev_table.item(0, 1).text())
+            self.assertIn("alle", page.ev_table.item(0, 5).text())
+            self.assertIn("-75 dBm", page.meter_lbl.text())
+
+
+@unittest.skipIf(QApplication is None, "PyQt6 fehlt")
+class AutoLevelsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_partly_filled_ring_buffer(self):
+        from wifidiver.ui.band_panel import BandPanel
+        p = BandPanel("2.4")
+        p.reset_sdr()
+        grid = p.grid
+        for _ in range(12):                       # weit weniger Zeilen als der Puffer fasst
+            p.push_sweep(grid, np.full(grid.size, -90.0), 0.0)
+        lv = p.auto_levels()
+        self.assertIsNotNone(lv)
+        self.assertAlmostEqual(lv[0], -93.0, places=3)

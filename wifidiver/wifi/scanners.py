@@ -28,6 +28,20 @@ def wireless_interfaces() -> list[str]:
     return out
 
 
+def is_monitor(iface: str) -> bool:
+    """Interface im Monitormodus (Linktyp 803 = Radiotap)? Dort gibt es keinen Scan."""
+    try:
+        with open(f"/sys/class/net/{iface}/type") as fh:
+            return fh.read().strip() == "803"
+    except OSError:
+        return False
+
+
+def scan_interfaces() -> list[str]:
+    """WLAN-Interfaces, mit denen normal gescannt werden kann (ohne Monitor-Interfaces)."""
+    return [i for i in wireless_interfaces() if not is_monitor(i)]
+
+
 def _iw_bin() -> str | None:
     return shutil.which("iw") or next((p for p in ("/sbin/iw", "/usr/sbin/iw") if os.path.exists(p)), None)
 
@@ -113,6 +127,9 @@ class IwScanner(Scanner):
             raise RuntimeError("iw nicht gefunden")
         if not self.iface:
             raise RuntimeError("kein WLAN-Interface gefunden")
+        if is_monitor(self.iface):
+            raise RuntimeError(f"{self.iface} ist im Monitormodus – dort gibt es keinen Scan. "
+                               "Quelle „monitor“ wählen (Tab „Monitor“)")
         if not _iface_up(self.iface):
             self.status = (f"{self.iface} ist down – z.B. 'sudo ip link set {self.iface} up' "
                            "(ohne NetworkManager)")
@@ -254,13 +271,43 @@ class DemoScanner(Scanner):
                     "channel active time": f"{c['act']} ms", "channel busy time": f"{c['busy']} ms"})
 
 
+class MonitorScanner(Scanner):
+    """Netze aus dem Monitormodus (Tab „Monitor“) – auch ohne zweiten WLAN-Adapter."""
+
+    name = "monitor"
+    MAX_AGE_S = 60.0
+
+    def __init__(self, backend):
+        super().__init__(None)
+        self.backend = backend
+
+    def scan(self) -> list[AccessPoint]:
+        from .monitor import ap_from_monitor
+        snap = self.backend.snapshot
+        if not self.backend.running or snap is None:
+            self.status = "Monitormodus läuft nicht – im Tab „Monitor“ starten"
+            return []
+        self.status = ""
+        now = time.time()
+        aps = []
+        for bssid, d in snap["bss"].items():
+            if now - d["last"] > self.MAX_AGE_S:
+                continue
+            ap = ap_from_monitor(bssid, d, now)
+            if ap is not None:
+                aps.append(ap)
+        return aps
+
+
 SCANNERS = {"iw": IwScanner, "nmcli": NmcliScanner, "demo": DemoScanner}
 
 
 def auto_scanner(iface: str | None) -> Scanner:
-    ifaces = wireless_interfaces()
-    if iface is None and ifaces:
+    ifaces = scan_interfaces()
+    if (iface is None or is_monitor(iface)) and ifaces:
         iface = ifaces[0]
+    elif iface is not None and is_monitor(iface):
+        iface = None
     if iface and _iw_bin():
         return IwScanner(iface)
     if _nm_running():

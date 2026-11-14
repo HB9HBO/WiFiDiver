@@ -130,6 +130,28 @@ def _yes(v: bool) -> str:
     return "ja" if v else "nein"
 
 
+def monitor_section(ap: AccessPoint) -> Section | None:
+    """Was der Monitormodus über dieses Netz weiß (Tab „Monitor“)."""
+    d = ap.extra.get("mon")
+    if not d:
+        return None
+    import time
+    rows: list[Row] = [
+        ("Clients (beobachtet)", str(d.get("clients", 0))),
+        ("Signal (Beacons)", "–" if d.get("signal") is None else f"{d['signal']:.0f} dBm"),
+        ("Beacons empfangen", str(d.get("beacons", 0))),
+        ("Daten-Frames vom AP", str(d.get("frames", 0))),
+    ]
+    if d.get("frames"):
+        rows.append(("Wiederholungen vom AP", f"{d.get('retries', 0) / d['frames'] * 100:.0f} %"))
+    if d.get("deauth"):
+        rows.append(("Deauth/Disassoc", f"{d['deauth']}  (viele in kurzer Zeit: Störung oder Angriff)"))
+    if d.get("hidden"):
+        rows.append(("Versteckte SSID", "ja" + (f" – aufgedeckt: {d['ssid']}" if d.get("ssid") else "")))
+    rows.append(("Zuletzt gehört", f"vor {max(0.0, time.time() - d.get('last', 0)):.0f} s"))
+    return ("Monitormodus", rows)
+
+
 def ap_details(ap: AccessPoint) -> list[Section]:
     """Abschnitte (Titel, [(Bezeichnung, Wert), …]) für die Anzeige."""
     lines: list[str] = ap.extra.get("ies") or []
@@ -154,9 +176,12 @@ def ap_details(ap: AccessPoint) -> list[Section]:
         ("Verbunden", "ja (dieses Gerät)" if ap.connected else "nein"),
     ]
     out: list[Section] = [("Allgemein", general)]
+    mon = monitor_section(ap)
     if not lines:
         general.append(("Hinweis", "Weitere Details (Informationselemente) nur mit der Quelle „iw“"))
         out.append(("Sicherheit", [("Sicherheit", ap.security)]))
+        if mon:
+            out.append(mon)
         return out
 
     # --- Allgemein, Fortsetzung -------------------------------------------------------------
@@ -308,6 +333,8 @@ def ap_details(ap: AccessPoint) -> list[Section]:
     vend = _vendor_ies(lines)
     if vend:
         out.append(("Hersteller-IEs", [("OUIs", vend)]))
+    if mon:
+        out.append(mon)
     return out
 
 

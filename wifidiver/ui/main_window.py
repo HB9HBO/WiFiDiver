@@ -5,9 +5,10 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import QSettings, QThread, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDockWidget, QHBoxLayout,
                              QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QPushButton,
-                             QScrollArea, QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout,
+                             QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableView, QTabWidget, QVBoxLayout,
                              QWidget)
 
 from ..sdr import BACKENDS
@@ -21,6 +22,7 @@ from .ap_table import ApFilterProxy, ApTableModel
 from .band_panel import BandPanel
 from .history import HistoryWidget
 from .info_page import InfoPage
+from .monitor_page import MonitorPage
 from .ssid_list import MODES, SsidList, SsidListDialog
 from .sdr_panel import SdrPanel
 
@@ -110,6 +112,7 @@ class MainWindow(QMainWindow):
         # GUI-Timer für SDR-Daten
         self._frame_dt = 0.04
         self._status_t = 0.0
+        self._auto_lv_until = 0.0           # Pegel automatisch anpassen, sobald genug Sweeps da sind
         self._frame_t = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll_sdr)
@@ -140,15 +143,17 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ Aufbau
     def _build_toolbar(self, source: str, iface: str | None) -> None:
         tb = self.addToolBar("WLAN")
+        self.toolbar = tb
         tb.setMovable(False)
         tb.addWidget(QLabel(" WLAN-Quelle: "))
         self.source = QComboBox()
-        self.source.addItems(["auto", "iw", "nmcli", "demo"])
+        self.source.addItems(["auto", "iw", "nmcli", "monitor", "demo"])
+        self.source.setItemData(3, "Netze aus dem Monitormodus (Tab „Monitor“)", Qt.ItemDataRole.ToolTipRole)
         self.source.setCurrentText(source)
         tb.addWidget(self.source)
         tb.addWidget(QLabel("  Interface: "))
         self.iface = QComboBox()
-        ifs = scanners.wireless_interfaces()
+        ifs = scanners.scan_interfaces()
         self.iface.addItems(ifs or ["(keins)"])
         if iface:
             if iface not in ifs:
@@ -162,7 +167,12 @@ class MainWindow(QMainWindow):
         self.interval.setSuffix(" s")
         tb.addWidget(self.interval)
         self.pause = QCheckBox("Pause")
+        self.pause.setStyleSheet("QCheckBox:checked { color: #e04040; font-weight: bold; }")
+        self.pause.setToolTip("WLAN-Scan anhalten, die Netze bleiben sichtbar.\n"
+                              "Wird beim Start des Monitormodus automatisch gesetzt und beim Stopp "
+                              "wieder aufgehoben.")
         tb.addWidget(self.pause)
+        self._paused_by_monitor = False
         self.scan_info = QLabel("")
         self.scan_info.setStyleSheet("color: #e0a040; padding-left: 12px;")
         tb.addWidget(self.scan_info)
@@ -170,7 +180,7 @@ class MainWindow(QMainWindow):
         self.source.currentTextChanged.connect(self._restart_scanner)
         self.iface.currentTextChanged.connect(self._restart_scanner)
         self.interval.valueChanged.connect(lambda v: setattr(self.worker, "interval", float(v)))
-        self.pause.toggled.connect(lambda on: setattr(self.worker, "paused", on))
+        self.pause.toggled.connect(self._on_pause)
 
     def _build_central(self) -> None:
         split = QSplitter(Qt.Orientation.Vertical)
@@ -219,6 +229,8 @@ class MainWindow(QMainWindow):
             self.table.setColumnWidth(col, w)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
+        self.table.doubleClicked.connect(self._zoom_to_row)
+        self.table.setToolTip("Doppelklick: Spektrum auf den Kanal dieses APs zoomen")
         tl.addWidget(self.table)
         split.addWidget(top)
 
@@ -236,6 +248,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.details, "Details")
         self.conn_page = InfoPage("Verbindung wird abgefragt …")
         self.tabs.addTab(self.conn_page, "Verbindung")
+        self.monitor_page = MonitorPage(self.settings)
+        self.monitor_page.updated.connect(self._on_monitor)
+        self.tabs.addTab(self.monitor_page, "Monitor")
+        self.monitor_page.alert.connect(self._on_monitor_alert)
+        self.monitor_page.runningChanged.connect(self._on_monitor_running)
         split.addWidget(self.tabs)
         split.setSizes([300, 650])
         self.setCentralWidget(split)
@@ -258,6 +275,16 @@ class MainWindow(QMainWindow):
         dock.setObjectName("sdr_dock")
         dock.setWidget(scroll)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.sdr_dock = dock
+        # Schließt man das Panel (X oben rechts), holt dieser Knopf es zurück
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.toolbar.addWidget(spacer)
+        act = dock.toggleViewAction()
+        act.setText("SDR-Panel")
+        act.setShortcut("F9")
+        act.setToolTip("SDR-Einstellungen ein-/ausblenden (F9)")
+        self.toolbar.addAction(act)
 
         sp = self.sdr_panel
         s = self.settings
@@ -267,6 +294,12 @@ class MainWindow(QMainWindow):
         sp.rows.setValue(int(s.value("disp/rows", 300)))
         i = sp.fps.findData(int(s.value("disp/fps", 25)))
         sp.fps.setCurrentIndex(max(i, 0))
+        sp.set_curve_colors({k: QColor(str(s.value(f"disp/color_{k}")))
+                             for k in ("live", "peak", "avg") if s.value(f"disp/color_{k}")})
+        sp.cb_fill.setChecked(s.value("disp/fill", False, type=bool))
+        sp.fill_alpha.setValue(int(s.value("disp/fill_alpha", 50)))
+        sp.live_avg.setValue(int(s.value("disp/live_avg", 0)))
+        sp.ap_alpha.setValue(int(s.value("disp/ap_alpha", 100)))
         sp.backendChanged.connect(self._on_backend_changed)
         sp.runToggled.connect(self._on_run_toggled)
         sp.paramChanged.connect(self._on_param_changed)
@@ -319,14 +352,28 @@ class MainWindow(QMainWindow):
         iface = self.iface.currentText()
         iface = None if iface.startswith("(") else iface
         if src == "auto":
+            if not scanners.scan_interfaces() and scanners.wireless_interfaces():
+                # nur Monitor-Interfaces vorhanden: Netze aus dem Monitormodus
+                return scanners.MonitorScanner(self.monitor_page.backend)
             return scanners.auto_scanner(iface)
+        if src == "monitor":
+            return scanners.MonitorScanner(self.monitor_page.backend)
         return scanners.SCANNERS[src](iface)
 
     def _restart_scanner(self) -> None:
         self.worker.scanner = self._make_scanner()
+        if self.monitor_page.backend.running:
+            # Quelle „monitor“ füllt die Tabelle aus dem Monitor – dann nicht pausieren
+            if self.worker.scanner.name == "monitor" and self._paused_by_monitor:
+                self.pause.setChecked(False)
+            elif self.worker.scanner.name != "monitor" and not self.pause.isChecked():
+                self.pause.setChecked(True)
+                self._paused_by_monitor = True
         self.scan_info.setText(self.worker.scanner.status)
 
     def _on_scan(self, aps: list) -> None:
+        self.monitor_page.set_names(aps)
+        self._annotate_monitor(aps)
         self.aps = aps
         self.model.set_aps(aps)
         self._push_aps()
@@ -340,6 +387,49 @@ class MainWindow(QMainWindow):
             f"{len(aps)} APs  (2.4 GHz: {counts['2.4']}, 5 GHz: {counts['5']}, 6 GHz: {counts['6']})"
             f"   Quelle: {self.worker.scanner.name}   {time.strftime('%H:%M:%S')}")
         self.scan_info.setText(self.worker.scanner.status)
+
+    # ------------------------------------------------------------------ Monitormodus
+    def _annotate_monitor(self, aps: list) -> None:
+        """Monitor-Daten (Clients, Beacons …) an die APs eines normalen Scans hängen."""
+        snap = self.monitor_page.backend.snapshot if self.monitor_page.backend.running else None
+        for ap in aps:
+            if ap.extra.get("source") == "monitor":
+                continue
+            d = snap["bss"].get(ap.bssid) if snap else None
+            if d is None:
+                ap.extra.pop("mon", None)
+            else:
+                ap.extra["mon"] = d
+
+    def _on_pause(self, on: bool) -> None:
+        self.worker.paused = on
+        if not on:
+            self._paused_by_monitor = False
+
+    def _on_monitor_running(self, running: bool) -> None:
+        """Monitor läuft: normalen Scan anhalten (Netze bleiben stehen), danach wieder fortsetzen."""
+        if running:
+            if self.worker.scanner.name != "monitor" and not self.pause.isChecked():
+                self.pause.setChecked(True)
+                self._paused_by_monitor = True
+        elif self._paused_by_monitor:
+            self.pause.setChecked(False)          # setzt auch _paused_by_monitor zurück
+
+    def _on_monitor_alert(self, n: int) -> None:
+        i = self.tabs.indexOf(self.monitor_page)
+        self.tabs.setTabText(i, f"Monitor ⚠ {n}" if n else "Monitor")
+        self.tabs.tabBar().setTabTextColor(i, QColor(230, 90, 60) if n else QColor())
+
+    def _on_monitor(self) -> None:
+        snap = self.monitor_page.backend.snapshot
+        if snap is None:
+            return
+        self.history.add_samples(snap.get("samples", []))
+        snap["samples"] = []
+        if self.aps and self.worker.scanner.name != "monitor":
+            self._annotate_monitor(self.aps)
+            if self.tabs.currentWidget() is self.details:
+                self._update_details()
 
     def _on_scan_failed(self, msg: str) -> None:
         self.scan_info.setText(msg)
@@ -574,8 +664,31 @@ class MainWindow(QMainWindow):
             if ap is None or ap.band != self.sdr_band:
                 self.sdr_panel.status.setText("Kein AP in diesem Band ausgewählt")
                 return
-            m = max(5.0, ap.width * 0.25)
-            self._set_range(ap.center_freq - ap.width / 2 - m, ap.center_freq + ap.width / 2 + m)
+            self._zoom_to_ap(ap)
+
+    def _zoom_to_row(self, idx) -> None:
+        """Doppelklick in der Tabelle: Band-Tab des APs zeigen und auf seinen Kanal zoomen."""
+        src = self.proxy.mapToSource(idx)
+        if not src.isValid() or src.row() >= len(self.model.aps):
+            return
+        ap = self.model.aps[src.row()]
+        if ap.band not in self.panels:
+            return
+        self._set_selected(ap.bssid)
+        self.tabs.setCurrentWidget(self.panels[ap.band])     # setzt auch sdr_band
+        self._zoom_to_ap(ap)
+
+    def _zoom_to_ap(self, ap) -> None:
+        """Sweep-Bereich und Ansicht auf die belegte Bandbreite des APs (mit etwas Rand)."""
+        width = float(ap.width or 20)
+        center = float(ap.center_freq or ap.freq)
+        m = max(5.0, width * 0.25)
+        self._set_range(center - width / 2 - m, center + width / 2 + m)
+        # auch zoomen, wenn der Sweep-Bereich schon stimmte, die Ansicht aber verschoben wurde
+        self.panels[ap.band].set_sdr_range(*self.sdr_ranges[ap.band])
+        # Pegel anpassen, sobald der neue Bereich genug Zeilen im Wasserfall hat
+        if self.backend is not None and self.backend.running:
+            self._auto_lv_until = time.monotonic() + 15.0
 
     def _drain(self) -> None:
         if self.backend is None:
@@ -612,9 +725,14 @@ class MainWindow(QMainWindow):
             p.show_live = sp.cb_live.isChecked()
             p.show_peak = sp.cb_peak.isChecked()
             p.show_avg = sp.cb_avg.isChecked()
+            p.set_curve_style(sp.curve_colors(), sp.cb_fill.isChecked(), sp.fill_alpha.value() / 100)
+            p.set_ap_intensity(sp.ap_alpha.value() / 100)
+            p.set_live_averaging(sp.live_avg.value())
             p.wf_dirty = True
         if self.backend is not None:
             self.settings.setValue(f"sdr/{self.backend.name}/offset", sp.offset.value())
+
+    AUTO_LV_ROWS = 20                       # Wasserfall-Zeilen vor der automatischen Pegelanpassung
 
     def _auto_levels(self) -> None:
         lv = self.panels[self.sdr_band].auto_levels()
@@ -649,6 +767,12 @@ class MainWindow(QMainWindow):
         if n:
             # alles seit dem letzten Takt ergibt eine Zeile (sehr schnelle Sweeps bei schmalem Bereich)
             panel.push_sweeps(batch, self._last_sweep.timestamp)
+            if self._auto_lv_until:
+                if panel.wf_count >= self.AUTO_LV_ROWS:
+                    self._auto_lv_until = 0.0
+                    self._auto_levels()
+                elif time.monotonic() > self._auto_lv_until:
+                    self._auto_lv_until = 0.0
             self._maybe_refresh(panel)
             now = time.time()
             if now - self._status_t < 0.5:     # Statuszeile nur 2×/s (spart Neuzeichnen)
@@ -681,7 +805,15 @@ class MainWindow(QMainWindow):
         s.setValue("disp/cmap", sp.cmap.currentText())
         s.setValue("disp/rows", sp.rows.value())
         s.setValue("disp/fps", sp.fps.currentData())
+        for k, c in sp.curve_colors().items():
+            s.setValue(f"disp/color_{k}", c.name(QColor.NameFormat.HexArgb))
+        s.setValue("disp/fill", sp.cb_fill.isChecked())
+        s.setValue("disp/fill_alpha", sp.fill_alpha.value())
+        s.setValue("disp/live_avg", sp.live_avg.value())
+        s.setValue("disp/ap_alpha", sp.ap_alpha.value())
         if self.backend is not None:
             self.backend.close()
+        self.monitor_page._save()
+        self.monitor_page.stop()
         self.worker.stop()
         super().closeEvent(ev)

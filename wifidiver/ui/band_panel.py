@@ -6,8 +6,9 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage
+from PyQt6.QtCore import QLineF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (QBrush, QColor, QFont, QGradient, QImage, QLinearGradient, QPainterPath,
+                         QPen)
 from PyQt6.QtWidgets import QLabel, QSplitter, QVBoxLayout, QWidget
 
 from ..sdr.base import GridMapper
@@ -19,6 +20,20 @@ from .ap_table import ap_color
 
 FLOOR = -100.0
 GRID_BINS = 1500
+# Standardfarben der Spektrumkurven (RGBA)
+CURVE_COLORS = {"live": (230, 230, 230, 170), "peak": (255, 90, 90, 150), "avg": (90, 160, 255, 255)}
+
+
+def fill_brush(color: QColor, alpha: float) -> QBrush:
+    """Verlauf wie bei gqrx: oben an der Kurve kräftig, zum Boden hin fast durchsichtig."""
+    g = QLinearGradient(0, 0, 0, 1)
+    g.setCoordinateMode(QGradient.CoordinateMode.ObjectBoundingMode)
+    top, bottom = QColor(color), QColor(color)
+    top.setAlphaF(max(0.0, min(1.0, alpha)))
+    bottom.setAlphaF(max(0.0, min(1.0, alpha * 0.12)))
+    g.setColorAt(0.0, bottom)     # Datenkoordinaten: y wächst nach oben
+    g.setColorAt(1.0, top)
+    return QBrush(g)
 
 
 class ChannelAxis(pg.AxisItem):
@@ -69,6 +84,57 @@ def cache_item(item) -> None:
     item.setCacheMode(item.CacheMode.DeviceCoordinateCache)
     for ch in item.childItems():
         cache_item(ch)
+
+
+class SpansItem(pg.GraphicsObject):
+    """Mehrere senkrechte Frequenzbereiche (oder Linien bei Breite 0) als EIN Element.
+
+    Ersetzt je Bereich ein LinearRegionItem (= zwei InfiniteLines): Diese hängen an der Ansicht und
+    wurden in jedem Bild einzeln neu gezeichnet. Hier liegt alles fest in Datenkoordinaten, ein
+    Zeichenaufruf genügt und der Pixmap-Cache bleibt gültig, solange nicht gezoomt wird.
+    """
+
+    def __init__(self, spans, brush=None, pen=None, y0: float = -400.0, y1: float = 200.0):
+        super().__init__()
+        self.Y0, self.Y1 = y0, y1     # Standard deckt jeden sinnvollen Pegelbereich ab
+        self.brush = QBrush(QColor(*brush)) if brush else None
+        if pen is not None:
+            pen = QPen(pen)
+            pen.setCosmetic(True)    # 1 Pixel breit, unabhängig vom Zoom
+        self.pen = pen
+        self.set_spans(spans)
+
+    def set_spans(self, spans) -> None:
+        self.prepareGeometryChange()
+        self.spans = [(float(a), float(b)) for a, b in spans] or [(0.0, 0.0)]
+        lo = min(a for a, _ in self.spans)
+        hi = max(b for _, b in self.spans)
+        self._rect = QRectF(lo, self.Y0, max(hi - lo, 1e-6), self.Y1 - self.Y0)
+        self._path = QPainterPath()
+        for a, b in self.spans:
+            self._path.addRect(QRectF(a, self.Y0, max(b - a, 1e-6), self.Y1 - self.Y0))
+        self.update()
+
+    def setRegion(self, rgn) -> None:          # wie LinearRegionItem
+        self.set_spans([rgn])
+
+    def boundingRect(self) -> QRectF:
+        return self._rect
+
+    def shape(self) -> QPainterPath:     # Tooltip nur über den Bereichen selbst
+        return self._path
+
+    def paint(self, p, *args) -> None:
+        if self.brush is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self.brush)
+            for a, b in self.spans:
+                if b > a:
+                    p.drawRect(QRectF(a, self.Y0, b - a, self.Y1 - self.Y0))
+        if self.pen is not None:
+            p.setPen(self.pen)
+            xs = sorted({x for ab in self.spans for x in ab})
+            p.drawLines([QLineF(x, self.Y0, x, self.Y1) for x in xs])
 
 
 class WaterfallItem(pg.GraphicsObject):
@@ -169,6 +235,9 @@ class BandPanel(QWidget):
         self.show_peak = True
         self.show_avg = False
         self.show_live = True
+        self.fill_on = False
+        self.live_alpha = 1.0     # Glättung des Live-Spektrums (1 = aus)
+        self.ap_alpha = 1.0       # Intensität der WLAN-Kanalkurven (0 = ausgeblendet)
         self.wf_dirty = False
         self.levels = (-100.0, -40.0)
         self._axis_t = 0.0
@@ -206,14 +275,19 @@ class BandPanel(QWidget):
         self._build_overlays(band_key)
 
         # ohne Kantenglättung: bei 1500 Punkten und 25 Bildern/s deutlich günstiger
-        self.c_avg = pg.PlotCurveItem(pen=pg.mkPen((90, 160, 255), width=1), antialias=False)
-        self.c_peak = pg.PlotCurveItem(pen=pg.mkPen((255, 90, 90, 150), width=1), antialias=False)
-        self.c_live = pg.PlotCurveItem(pen=pg.mkPen((230, 230, 230, 170), width=1), antialias=False)
+        self.c_avg = pg.PlotCurveItem(pen=pg.mkPen(CURVE_COLORS["avg"], width=1), antialias=False)
+        self.c_peak = pg.PlotCurveItem(pen=pg.mkPen(CURVE_COLORS["peak"], width=1), antialias=False)
+        self.c_live = pg.PlotCurveItem(pen=pg.mkPen(CURVE_COLORS["live"], width=1), antialias=False)
+        # Füllung als eigene Kurve: Lücken (NaN) würden die Füllfläche der Linie verzerren
+        self.c_fill = pg.PlotCurveItem(pen=pg.mkPen(None), fillLevel=FLOOR, antialias=False)
+        self.c_fill.setZValue(4)
+        self.cplot.addItem(self.c_fill)
         for c in (self.c_avg, self.c_peak, self.c_live):
             c.setZValue(5)
             self.cplot.addItem(c)
-        self.sdr_span = pg.LinearRegionItem((self.f0, self.f1), movable=False, brush=(80, 160, 255, 14),
-                                            pen=pg.mkPen((80, 160, 255, 120), width=1))
+        self.set_curve_style(CURVE_COLORS, False, 0.5)
+        self.sdr_span = SpansItem([(self.f0, self.f1)], brush=(80, 160, 255, 14),
+                                  pen=pg.mkPen((80, 160, 255, 120), width=1))
         self.sdr_span.setZValue(-5)
         self.sdr_span.hide()
         self.cplot.addItem(self.sdr_span)
@@ -231,9 +305,8 @@ class BandPanel(QWidget):
         self._place_image()
         self.wplot.addItem(self.wimg)
         self.wplot.setYRange(0, self.rows, padding=0)
-        self.sel_region = pg.LinearRegionItem(movable=False, brush=(255, 255, 255, 0),
-                                              pen=pg.mkPen((255, 255, 255, 160), width=1,
-                                                           style=Qt.PenStyle.DashLine))
+        self.sel_region = SpansItem([(self.f0, self.f1)], y0=-1e5, y1=1e5,
+                                    pen=pg.mkPen((255, 255, 255, 160), width=1, style=Qt.PenStyle.DashLine))
         self.sel_region.setZValue(10)
         self.sel_region.hide()
         self.wplot.addItem(self.sel_region)
@@ -246,7 +319,7 @@ class BandPanel(QWidget):
         for p in (self.cplot, self.wplot):
             p.getAxis("left").setWidth(60)
 
-        live = {self.c_live, self.c_peak, self.c_avg}
+        live = {self.c_live, self.c_peak, self.c_avg, self.c_fill}
         for it in self.cplot.getPlotItem().items:
             if it not in live:
                 cache_item(it)
@@ -260,22 +333,21 @@ class BandPanel(QWidget):
     # ------------------------------------------------------------------ Markierungen
     def _add_band_markers(self, band_key: str) -> None:
         if band_key == "5":
-            for ch in sorted(DFS_CHANNELS_5G):
-                f = channel_to_freq(ch, "5")
-                r = pg.LinearRegionItem((f - 10, f + 10), movable=False,
-                                        brush=(255, 160, 0, 18), pen=pg.mkPen(None))
-                r.setZValue(-10)
-                self.cplot.addItem(r)
+            spans = [(channel_to_freq(ch, "5") - 10, channel_to_freq(ch, "5") + 10)
+                     for ch in sorted(DFS_CHANNELS_5G)]
+            r = SpansItem(spans, brush=(255, 160, 0, 18))
+            r.setZValue(-10)
+            self.cplot.addItem(r)
             t = pg.TextItem("DFS", color=(255, 170, 40), anchor=(0.5, 0))
             t.setPos(channel_to_freq(100, "5") + 70, -16)
             self.cplot.addItem(t)
         if band_key == "6":
-            for ch in band_channels("6"):
-                if is_psc(ch):
-                    line = pg.InfiniteLine(channel_to_freq(ch, "6"), angle=90,
-                                           pen=pg.mkPen((120, 200, 255, 60), style=Qt.PenStyle.DotLine))
-                    line.setZValue(-10)
-                    self.cplot.addItem(line)
+            fs = [channel_to_freq(ch, "6") for ch in band_channels("6") if is_psc(ch)]
+            if fs:
+                line = SpansItem([(f, f) for f in fs],
+                                 pen=pg.mkPen((120, 200, 255, 60), style=Qt.PenStyle.DotLine))
+                line.setZValue(-10)
+                self.cplot.addItem(line)
 
     # ------------------------------------------------------------------ andere Funkdienste
     def _build_overlays(self, band_key: str) -> None:
@@ -310,12 +382,11 @@ class BandPanel(QWidget):
                     t.setPos((lo + hi) / 2, y)
                     t.setZValue(7)
                     items.append(t)
+                reg = SpansItem([(c.center - c.width / 2, c.center + c.width / 2) for c in chans],
+                                brush=(r, g, b, 26), pen=pg.mkPen((r, g, b, 120), width=1))
+                reg.setZValue(-8)
+                items.append(reg)
                 for c in chans:
-                    reg = pg.LinearRegionItem((c.center - c.width / 2, c.center + c.width / 2),
-                                              movable=False, brush=(r, g, b, 26),
-                                              pen=pg.mkPen((r, g, b, 120), width=1))
-                    reg.setZValue(-8)
-                    items.append(reg)
                     if c.label and not o.group_label:
                         t = pg.TextItem(o.tag + c.label, color=(r, g, b), anchor=(0.5, 0))
                         t.setFont(font)
@@ -336,6 +407,28 @@ class BandPanel(QWidget):
             for it in items:
                 it.setVisible(vis)
 
+    # ------------------------------------------------------------------ Darstellung
+    def set_curve_style(self, colors: dict, fill: bool, fill_alpha: float) -> None:
+        """Farben der Kurven (live/peak/avg, QColor oder RGBA) und Füllung unter dem Live-Spektrum."""
+        for key, curve in (("live", self.c_live), ("peak", self.c_peak), ("avg", self.c_avg)):
+            curve.setPen(pg.mkPen(colors[key], width=1))
+        self.fill_on = fill
+        col = pg.mkColor(colors["live"])
+        col.setAlpha(255)
+        self.c_fill.setBrush(fill_brush(col, fill_alpha))
+        self.wf_dirty = True
+
+    def set_live_averaging(self, pct: float) -> None:
+        """0 % = ungeglättet, 100 % = Mittel über ca. 10 Sweeps."""
+        self.live_alpha = 1.0 / (1.0 + max(0.0, min(100.0, pct)) / 10.0)
+
+    def set_ap_intensity(self, f: float) -> None:
+        """Deckkraft der WLAN-Kanalkurven: 1 = volle Stärke, 0 = ausgeblendet."""
+        f = max(0.0, min(1.0, f))
+        if f != self.ap_alpha:
+            self.ap_alpha = f
+            self.set_selected(self.selected)
+
     # ------------------------------------------------------------------ APs
     def set_aps(self, aps: list[AccessPoint], all_aps: list[AccessPoint] | None = None) -> None:
         """aps: angezeigte APs; all_aps: alle (für die Signalerkennung, unabhängig vom Filter)."""
@@ -347,9 +440,7 @@ class BandPanel(QWidget):
             item = self.ap_items.get(ap.bssid)
             if item is None:
                 col = ap_color(ap.bssid)
-                fill = QColor(col)
-                fill.setAlpha(45)
-                curve = pg.PlotCurveItem(pen=pg.mkPen(col, width=2), brush=fill, fillLevel=FLOOR)
+                curve = pg.PlotCurveItem(pen=pg.mkPen(col, width=2), fillLevel=FLOOR)
                 text = pg.TextItem(color=col, anchor=(0.5, 1.0))
                 self.cplot.addItem(curve)
                 self.cplot.addItem(text)
@@ -371,13 +462,22 @@ class BandPanel(QWidget):
 
     def set_selected(self, bssid: str | None) -> None:
         self.selected = bssid
+        k = self.ap_alpha
         for b, (curve, text) in self.ap_items.items():
-            col = ap_color(b)
             sel = b == bssid
-            curve.setPen(pg.mkPen(col, width=4 if sel else 2))
+            vis = k > 0
+            curve.setVisible(vis)
+            text.setVisible(vis)
+            if not vis:
+                continue
+            col = QColor(ap_color(b))
+            line = QColor(col)
+            line.setAlphaF(k)
+            curve.setPen(pg.mkPen(line, width=4 if sel else 2))
             fill = QColor(col)
-            fill.setAlpha(110 if sel else (25 if bssid else 45))
+            fill.setAlpha(round((110 if sel else (25 if bssid else 45)) * k))
             curve.setBrush(fill)
+            text.setColor(line)
             curve.setZValue(3 if sel else 1)
             text.setZValue(4 if sel else 2)
         ap = next((a for a in self.aps if a.bssid == bssid), None)
@@ -466,7 +566,7 @@ class BandPanel(QWidget):
         self.wf_count = 0
         self.wimg.recolor(self.wf, 0)
         self.live = self.peak = self.avg = None
-        for c in (self.c_live, self.c_peak, self.c_avg):
+        for c in (self.c_live, self.c_peak, self.c_avg, self.c_fill):
             c.setData([], [])
         self.wf_dirty = True
 
@@ -492,7 +592,11 @@ class BandPanel(QWidget):
         row = self.mapper.map(sweeps, self.s0, self.s1, GRID_BINS)
         if row is None:
             return
-        self.live = row
+        a = self.live_alpha
+        if a >= 1.0 or self.live is None or self.live.shape != row.shape:
+            self.live = row
+        else:     # exponentielles Mittel in dB (wie gqrx); Lücken übernehmen den neuen Wert
+            self.live = np.where(np.isfinite(self.live), self.live + a * (row - self.live), row)
         if self.peak is None:
             self.peak = row.copy()
         else:
@@ -606,7 +710,11 @@ class BandPanel(QWidget):
         self.wf_dirty = True
 
     def auto_levels(self) -> tuple[float, float] | None:
-        data = self.wf[: self.wf_count] if self.wf_count < self.rows else self.wf
+        # Ringpuffer: die gefüllten Zeilen liegen ab wf_pos (neueste) und laufen ggf. über das Ende
+        if self.wf_count < self.rows:
+            data = self.wf[(self.wf_pos + np.arange(self.wf_count)) % self.rows]
+        else:
+            data = self.wf
         valid = data[data > -199]
         if valid.size < 10:
             return None
@@ -639,3 +747,8 @@ class BandPanel(QWidget):
                 curve.setData(x, data + self.offset, connect="finite")
             else:
                 curve.setData([], [])
+        if self.fill_on and self.show_live and self.live is not None:
+            y = self.live + self.offset
+            self.c_fill.setData(x, np.maximum(np.nan_to_num(y, nan=FLOOR), FLOOR))
+        else:
+            self.c_fill.setData([], [])

@@ -294,7 +294,9 @@ class UHDBackend(SdrBackend):
         Param("averages", "Mittelungen", "int", 16, 1, 512, 1, live=True),
         Param("usable", "Genutzte Bandbreite", "float", 0.75, 0.3, 0.95, 0.05, suffix=" ×Rate"),
         Param("settle", "Einschwingzeit", "float", 0.5, 0.0, 20.0, 0.1, live=True, suffix=" ms"),
-        Param("max_rate", "Max. Sweeps/s (0 = frei)", "int", 0, 0, 500, 5, live=True),
+        # Standard 25 = Standard-Bildrate: schnellere Sweeps werden ohnehin zu einer Wasserfallzeile
+        # zusammengefasst; ungebremst (~75/s) kostet der USRP etwa dreimal so viel CPU
+        Param("max_rate", "Max. Sweeps/s (0 = frei)", "int", 25, 0, 500, 5, live=True),
     ]
 
     def __init__(self, settings: dict | None = None):

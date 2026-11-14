@@ -9,6 +9,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+try:      # scipy rechnet complex64 in einfacher Genauigkeit – ca. 4× schneller als numpy (immer double)
+    from scipy import fft as _fft
+except ImportError:  # pragma: no cover
+    _fft = None
+
 
 @dataclass
 class Sweep:
@@ -137,8 +142,8 @@ def psd_dbfs(samples: np.ndarray, fft_size: int, window: np.ndarray) -> np.ndarr
     if n == 0:
         return np.full(fft_size, -150.0)
     segs = samples[:n].reshape(-1, fft_size) * window
-    spec = np.fft.fft(segs, axis=1)
-    p = np.mean(np.abs(spec) ** 2, axis=0) / (np.sum(window) ** 2)
+    spec = _fft.fft(segs, axis=1, overwrite_x=True) if _fft is not None else np.fft.fft(segs, axis=1)
+    p = np.mean(spec.real ** 2 + spec.imag ** 2, axis=0) / (np.sum(window, dtype=np.float64) ** 2)
     return 10.0 * np.log10(np.fft.fftshift(p) + 1e-20)
 
 
