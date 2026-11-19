@@ -2,7 +2,9 @@
 
 WLAN-Analyzer für Linux im Stil von [WaveScope](https://github.com/yurividal/WaveScope).
 Zusätzlich zeigt der Kanalgraph das echte HF-Spektrum und einen **Wasserfall eines SDR**
-(HackRF One oder UHD/USRP), sodass man die Beacons/Bursts der APs direkt sieht.
+(HackRF One, UHD/USRP oder ein AD9361-Gerät wie der HamGeek E310 über das Netz), sodass man die Beacons/Bursts der APs direkt sieht.
+
+![WifiDiver mit Demo-Daten: AP-Tabelle, Kanalgraph mit SDR-Spektrum, Wasserfall mit Signalerkennung](docs/screenshot.png)
 
 ## Funktionen
 
@@ -59,6 +61,7 @@ sudo uhd_images_downloader   # FPGA-/Firmware-Images für USRP
 ./wifidiver.sh                        # automatisch: iw (oder nmcli), SDR aus Einstellungen
 ./wifidiver.sh --sdr HackRF --start   # HackRF-Sweep sofort starten
 ./wifidiver.sh --sdr UHD --band 5 --start
+./wifidiver.sh --sdr E310 --start     # E310 über das Netz (e310d muss auf dem Gerät laufen)
 ./wifidiver.sh --source demo --sdr Demo --start   # komplett ohne Hardware
 ```
 
@@ -137,6 +140,7 @@ Bin-Breite (HackRF) anpassen.
 |---|---|---|---|
 | HackRF One | `hackrf_sweep -B` (Subprozess, Binärausgabe) | 1–7250 MHz | 2.4 GHz: ~80 Sweeps/s, 5 GHz: ~11/s |
 | UHD (B2xx, N2xx, X3xx …) | Python-`uhd` in eigenem Prozess, schrittweises Abstimmen und Zusammensetzen der FFTs | geräteabhängig (B210: 70–6000 MHz) | B210 an USB 3, 56 MS/s: 2.4 GHz ~80/s, 5 GHz ~3/s |
+| E310 (AD9361 mit Pluto-/ANTSDR-Firmware, Ethernet) | `e310d` auf dem Gerät rechnet die Spektren, übertragen werden nur die Werte (TCP) | 70–6000 MHz | 30.72 MS/s, 16 Mittelungen: 2.4 GHz ~58/s, 5 GHz ~9/s (zwei Kerne; mit einem: ~33/s bzw. ~5/s) |
 
 Hinweise:
 - Die SDR-Werte sind **nicht kalibriert** (HackRF: dB, UHD: dBFS). Mit dem *Pegel-Offset* lassen sie sich
@@ -154,6 +158,38 @@ Hinweise:
   beim WLAN-Scan ab (`streaming stopped (-1003)`). WifiDiver startet `hackrf_sweep` dann automatisch neu
   (Anzeige „× neu gestartet“); besser den HackRF an einen eigenen Port/Controller anschließen.
 - Das 6-GHz-Band reicht beim B210 nur bis 6 GHz.
+
+### E310 über das Netz
+
+Der HamGeek E310 (Zynq 7020 + AD9361, meldet sich als „ANTSDR“) läuft mit Pluto-Firmware und hat Gigabit-
+Ethernet. Rohdaten über `iiod` schaffen dort nur ~460 Mbit/s (≈ 14 MS/s) und die FFT läge beim PC. Deshalb
+läuft auf dem Gerät ein kleiner Server (`helper/e310/e310d`): Er stimmt den AD9361 direkt über sysfs ab,
+liest die Samples aus `/dev/iio:deviceN`, rechnet Fenster, FFT (pffft, NEON) und Mittelung und schickt pro
+Sweep nur die Leistungswerte als int16 (0.01 dB). Das 2.4-GHz-Band mit 25 Sweeps/s braucht so ~1.3 Mbit/s,
+WifiDiver selbst ~2 % CPU.
+
+Einrichten (einmalig):
+
+1. Ethernet-Adresse in `config.txt` auf dem USB-Laufwerk des Geräts eintragen (`[NETWORK]`, `ipaddr_eth`,
+   `netmask_eth`), **Laufwerk auswerfen** (erst dann wird die Datei übernommen) und das Gerät neu starten.
+2. SSH-Schlüssel hinterlegen: `ssh-copy-id root@<adresse>` (Passwort `analog`).
+3. Server übersetzen und installieren (braucht `gcc-arm-linux-gnueabihf`):
+   `make -C helper/e310 install HOST=<adresse>`
+
+Der Server liegt dann in `/mnt/jffs2` (übersteht Neustarts), wird über `/mnt/jffs2/autorun.sh` beim Booten
+gestartet und nach einem Absturz neu gestartet; die SSH-Schlüssel werden mit `device_persistent_keys`
+gesichert. Entfernen: `make -C helper/e310 uninstall HOST=<adresse>`. Log auf dem Gerät: `/tmp/e310d.log`.
+
+Hinweise:
+- Port 7355, ohne Anmeldung – nur im eigenen Netz betreiben. Ein neuer Client ersetzt den bisherigen.
+- Während des Sweeps ist der TX-LO abgeschaltet (Pluto-Firmware: 2.45 GHz, wäre sonst als Linie zu sehen).
+- *Max. Werte pro Sweep* (Standard 4096) fasst benachbarte Bins im Gerät per Maximum zusammen; die Anzeige
+  rastert ohnehin auf 1500 Punkte.
+- Bei *Verstärkung* ≠ manual (AGC) rechnet der Server die Werte auf den eingestellten RX-Gain um, damit die
+  Schritte vergleichbar bleiben.
+- Die Pluto-Firmware startet standardmäßig nur einen der beiden ARM-Kerne (`maxcpus=1`). Mit
+  `fw_setenv maxcpus 2` und Neustart laufen Aufnahme und FFT parallel (2.4 GHz: 33 → 58 Sweeps/s, 5 GHz: 5 → 9;
+  Chiptemperatur dabei ~56–59 °C).
 
 ### CPU-Last (Raspberry Pi, ältere Notebooks)
 
@@ -218,11 +254,12 @@ wifidiver/
           oui.py, overlays.py (Kanalraster anderer Funkdienste), details.py (Details-Tab),
           connection.py (Verbindung-Tab), ieee80211.py (Radiotap/802.11/IEs),
           monitor.py (Monitormodus: Auswertung, Worker-Prozess), threats.py (Angriffserkennung)
-  sdr/    base.py (Thread, PSD, Raster-Resampling), hackrf.py, uhd_sdr.py, demo.py,
+  sdr/    base.py (Thread, PSD, Raster-Resampling), hackrf.py, uhd_sdr.py, e310.py (Netz-Client), demo.py,
           classify.py (Signalerkennung)
   ui/     main_window.py, band_panel.py (Kanalgraph+Wasserfall), ap_table.py, history.py, sdr_panel.py,
           info_page.py (Details/Verbindung), ssid_list.py, monitor_page.py
 helper/   wifidiver-monitor.c (Hilfsprogramm mit Capabilities für den Monitormodus), Makefile
+  e310/   e310d.c (Spektrum-Server für das Gerät), pffft.c/h (FFT, BSD-artige Lizenz), install.sh, Makefile
 ```
 
 Neue SDRs: Klasse von `SdrBackend` ableiten, `params` und `run()` implementieren

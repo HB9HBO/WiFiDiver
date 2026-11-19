@@ -1,4 +1,4 @@
-"""Start: python3 -m wifidiver [--source demo] [--sdr HackRF|UHD|Demo] [--start]"""
+"""Start: python3 -m wifidiver [--source demo] [--sdr HackRF|UHD|E310|Demo] [--start]"""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--source", choices=["auto", "iw", "nmcli", "demo"], default="auto",
                     help="WLAN-Datenquelle (Standard: auto)")
     ap.add_argument("--iface", help="WLAN-Interface, z.B. wlan0")
-    ap.add_argument("--sdr", choices=["HackRF", "UHD", "Demo"], help="SDR-Backend")
+    ap.add_argument("--sdr", choices=["HackRF", "UHD", "E310", "Demo"], help="SDR-Backend")
     ap.add_argument("--start", action="store_true", help="SDR-Sweep sofort starten")
     ap.add_argument("--band", choices=["2.4", "5", "6"], help="Start-Band")
     ap.add_argument("--light", action="store_true", help="helles Farbschema")
